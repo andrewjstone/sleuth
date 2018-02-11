@@ -106,54 +106,83 @@ impl<M> Checker<M> where M: Model {
     /// Determine if the history is linearizable with respect to the sequential model
     ///
     /// Returns None if the check succeeds, otherwise returns a FailureCtx
-    pub fn check(&mut self) -> Option<FailureCtx> {
+    pub fn check(&mut self) -> Result<(), FailureCtx> {
         let len = self.history.len();
         let current = self.current;
-        let mut entry = unsafe { &mut *self.get_entry(current) };
-        while self.head + 1 < len {
-            match entry.matched {
+        let mut entry = self.get_entry(current);
+        let mut head = self.head;
+        while head + 1 < len {
+            match unsafe { (*entry).matched } {
                 Some(return_index) => {
-                    let (is_linearizable, new_state) = self.apply(entry, return_index);
-                    if is_linearizable {
-                        let mut linearized = self.linearized.clone();
-                        let _ = linearized.insert(entry.id);
-                        let not_yet_cached = self.cache.insert((linearized, new_state.clone()));
-                        if not_yet_cached {
-                            // provisionally linearize
-                            self.calls.push((self.current, self.model.state()));
-                            self.model.set_state(new_state);
-                            self.linearized.insert(entry.id);
-                            self.lift(entry);
-                            self.head += 1;
-                            let head = self.head;
-                            entry = unsafe { &mut *self.get_entry(head) };
-                        } else {
-                            // move onto the next entry
-                            self.current += 1;
-                            let current = self.current;
-                            entry = unsafe { &mut *self.get_entry(current) };
-                        }
-                    }
+                    entry = self.handle_call(entry, return_index);
+                    head = self.head;
                 }
                 None => {
-                    match self.calls.pop() {
-                        Some((index, new_state)) => {
-                            // revert to prior state
-                            self.model.set_state(new_state);
-                            entry = unsafe { &mut *self.get_entry(index) };
-                            self.linearized.remove(entry.id);
-                            self.unlift(entry);
-                            self.current = index + 1;
-                            entry = unsafe { &mut *self.get_entry(index + 1) };
-                        }
-                        None => {
-                            return Some(FailureCtx{});
-                        }
-                    }
+                    entry = self.handle_return()?;
                 }
             }
         }
-        None
+        Ok(())
+    }
+
+    /// Process a call entry in the history
+    fn handle_call(&mut self, entry: *mut Entry<M>, return_index: usize) -> *mut Entry<M> {
+        let entry = unsafe { &mut *entry };
+        let (is_linearizable, new_state) = self.apply(entry, return_index);
+        if is_linearizable && self.update_cache(entry, new_state.clone()) {
+            return self.provisionally_linearize(entry, new_state);
+        }
+        // move onto the next entry
+        self.current += 1;
+        let current = self.current;
+        self.get_entry(current)
+    }
+
+
+    /// Treat the current entry as linearizable in our history
+    ///
+    /// At this point the call entry has been shown to be linearizable, and also was not checked
+    /// prior since it was not in the cache. Put the entry in the calls stack, remove it from the
+    /// history, update the model state and head pointer, and return the next entry to be tested.
+    fn provisionally_linearize(&mut self, entry: &mut Entry<M>, new_state: M::State) -> *mut Entry<M> {
+            self.calls.push((self.current, self.model.state()));
+            self.model.set_state(new_state);
+            self.linearized.insert(entry.id);
+            self.lift(entry);
+            if self.head == self.current {
+                self.head += 1;
+                self.current += 1;
+            }
+            let head = self.head;
+            self.get_entry(head)
+    }
+
+    /// If the call is linearizable, update the cache.
+    /// Return true if the cache was updated, false otherwise
+    fn update_cache(&mut self, entry: &Entry<M>, new_state: M::State) -> bool {
+        let mut linearized = self.linearized.clone();
+        let _ = linearized.insert(entry.id);
+        self.cache.insert((linearized, new_state))
+    }
+
+    /// Process a return entry in the history
+    fn handle_return(&mut self) -> Result<*mut Entry<M>, FailureCtx> {
+        match self.calls.pop() {
+            Some((index, new_state)) => {
+                // revert to prior state
+                self.model.set_state(new_state);
+                let entry = unsafe { &mut *self.get_entry(index) };
+                self.linearized.remove(entry.id);
+                self.unlift(entry);
+                // TODO: Reset HEAD?
+                self.current = index + 1;
+                return Ok(self.get_entry(index + 1));
+
+            }
+            None => {
+                return Err(FailureCtx{});
+            }
+        }
     }
 
     fn apply(&self, entry: &Entry<M>, return_index: usize) -> (bool, M::State) {
@@ -192,12 +221,12 @@ impl<M> Checker<M> where M: Model {
 
     /// Return a mutable pointer to an element of the history Vec
     ///
-    /// `unsafe` is required because we often need two references into the vec: one for the call
-    /// entry, and one for the return entry.
+    /// A raw pointer is required because we often need two references into the vec: one for the
+    /// call entry, and one for the return entry.
     ///
     /// Note that the only part of the entry that we ever mutate is the `removed` field.
-    /// Also, note that we must never hold two references to the same entry, and we never remove or
-    /// add entries to the history.
+    /// Also, note that we never hold two references to the same entry, and we never remove or add
+    /// entries to the history, therfore it can not be moved to invalidate our pointers.
     fn get_entry(&mut self, index: usize) -> *mut Entry<M> {
         unsafe {
             self.history.get_unchecked_mut(index) as *mut Entry<M>
