@@ -61,8 +61,11 @@ pub struct Entry<M: Model> {
     /// The index to the return operation if this is a call
     matched: Option<usize>,
 
-    /// Whether the entry has been provisionally linearized or 'lifted' into the `calls` stack.
-    removed: bool
+    /// The index of the entry prior to this in the history, None if this is the first entry.
+    prev: Option<usize>,
+
+    /// The index of the entry after this one in the history. None if this is the last entry.
+    next: Option<usize>
 }
 
 /// The relevant parts of the history when it is not linearizable.
@@ -108,9 +111,8 @@ impl<M> Checker<M> where M: Model {
     /// Returns None if the check succeeds, otherwise returns a FailureCtx
     pub fn check(&mut self) -> Result<(), FailureCtx> {
         let len = self.history.len();
-        let current = self.current;
-        let mut entry = self.get_entry(current);
         let mut head = self.head;
+        let mut entry = self.get_entry(head);
         while head + 1 < len {
             match unsafe { (*entry).matched } {
                 Some(return_index) => {
@@ -132,10 +134,12 @@ impl<M> Checker<M> where M: Model {
         if is_linearizable && self.update_cache(entry, new_state.clone()) {
             return self.provisionally_linearize(entry, new_state);
         }
-        // move onto the next entry
-        self.current += 1;
-        let current = self.current;
-        self.get_entry(current)
+        // Since we only allow complete histories (every call has a return), it is safe to
+        // call unwrap, as there must at least be a return after this entry.
+        let next = entry.next.unwrap();
+        // Move onto the next entry
+        self.current = next;
+        self.get_entry(next)
     }
 
 
@@ -149,11 +153,8 @@ impl<M> Checker<M> where M: Model {
             self.model.set_state(new_state);
             self.linearized.insert(entry.id);
             self.lift(entry);
-            if self.head == self.current {
-                self.head += 1;
-                self.current += 1;
-            }
             let head = self.head;
+            self.current = head;
             self.get_entry(head)
     }
 
@@ -169,14 +170,15 @@ impl<M> Checker<M> where M: Model {
     fn handle_return(&mut self) -> Result<*mut Entry<M>, FailureCtx> {
         match self.calls.pop() {
             Some((index, new_state)) => {
-                // revert to prior state
+                // Revert to prior state
                 self.model.set_state(new_state);
                 let entry = unsafe { &mut *self.get_entry(index) };
                 self.linearized.remove(entry.id);
-                self.unlift(entry);
-                // TODO: Reset HEAD?
-                self.current = index + 1;
-                return Ok(self.get_entry(index + 1));
+                self.unlift(entry, index);
+                // We took a call off the stack, so there must be at least a return after it.
+                let next = entry.next.unwrap();
+                self.current = next;
+                return Ok(self.get_entry(next));
 
             }
             None => {
@@ -204,19 +206,52 @@ impl<M> Checker<M> where M: Model {
 
 
     /// Remove the call and its matching return from `history`
+    ///
+    /// Since this is a call, we can always unwrap calls to `next`.
     fn lift(&mut self, entry: &mut Entry<M>) {
-        entry.removed = true;
-        if let Some(index) = entry.matched {
-            self.history[index].removed = true;
+        let next = entry.next.unwrap();
+        match entry.prev {
+            Some(prev_index) => {
+                self.history[prev_index].next = Some(next);
+                self.history[next].prev = Some(prev_index);
+            }
+            None => {
+                // This entry is the current head.
+                // Make the next entry the Head entry
+                self.history[next].prev = None;
+                self.head = next;
+            }
+        }
+        let match_index = entry.matched.unwrap();
+        let match_prev = self.history[match_index].prev;
+        let match_next = self.history[match_index].next;
+        self.history[match_prev.unwrap()].next = match_next;
+        if let Some(next) = match_next {
+            self.history[next].prev = match_prev;
         }
     }
 
-    /// Add a call and its matching return back into history as it is not linearizable
-    fn unlift(&mut self, entry: &mut Entry<M>) {
-        entry.removed = false;
-        if let Some(index) = entry.matched {
-            self.history[index].removed = false;
+    /// Add a call and return back into history as it is not linearizable in the current order.
+    ///
+    /// Since this is a call, we can always unwrap calls to `next`.
+    fn unlift(&mut self, entry: &mut Entry<M>, entry_index: usize) {
+        let match_index = entry.matched.unwrap();
+        let match_prev = self.history[match_index].prev;
+        let match_next = self.history[match_index].next;
+        self.history[match_prev.unwrap()].next = Some(match_index);
+        if let Some(next) = match_next {
+            self.history[next].prev = Some(match_index);
         }
+        let next = entry.next.unwrap();
+        match entry.prev {
+            Some(prev_index) => {
+                self.history[prev_index].next = Some(entry_index);
+            }
+            None => {
+                self.head = entry_index;
+            }
+        }
+        self.history[next].prev = Some(entry_index);
     }
 
     /// Return a mutable pointer to an element of the history Vec
