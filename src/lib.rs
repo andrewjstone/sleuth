@@ -1,6 +1,7 @@
 extern crate bit_set;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Instant;
 use bit_set::BitSet;
@@ -13,13 +14,13 @@ use bit_set::BitSet;
 pub trait Model {
     /// A Call contains an operation on a sequential type (the implementor of this model) and its
     /// arguments. It is typically an enum unless the model only has one operation.
-    type Call;
+    type Call: Debug;
 
     /// The return value of an operation on the sequential data type
-    type ReturnValue: Eq;
+    type ReturnValue: Eq + Debug;
 
     /// The current state of the model
-    type State: Hash + Eq + Clone;
+    type State: Hash + Eq + Clone + Debug;
 
     /// Apply an operation to the model
     ///
@@ -36,6 +37,7 @@ pub trait Model {
 /// The type representing either an operation call or return. A return can also be represented as a
 /// Timeout, which means that there never was a return. In this case, it is considered concurrent
 /// with all operations issued after its call.
+#[derive(Debug)]
 pub enum Op<M: Model> {
     Call(M::Call),
     Return(M::ReturnValue),
@@ -47,6 +49,7 @@ pub enum Op<M: Model> {
 /// Only one operation per client can be outstanding at a time. This type is used during the
 /// recording phase of a test run. Before analysis all ops are totally ordered and converted to
 /// entries.
+#[derive(Debug)]
 pub struct Event<M: Model> {
     client_id: usize,
     time: Instant,
@@ -54,6 +57,7 @@ pub struct Event<M: Model> {
 }
 
 /// An entry in a History
+#[derive(Debug)]
 pub struct Entry<M: Model> {
     id: usize,
     event: Event<M>,
@@ -68,10 +72,52 @@ pub struct Entry<M: Model> {
     next: Option<usize>
 }
 
+/// Take an ordered list of events and convert them to a history
+fn events_to_history<M>(events: Vec<Event<M>>) -> Vec<Entry<M>> where M: Model {
+    /// Map of client calls to (entry id, entry index) pairs. There is only one outstanding call per
+    /// client at at a time, so the size of this map is bounded by the number of clients.
+    let mut ids = HashMap::<usize, (usize, usize)>::new();
+    /// The current number of calls iterated over
+    let mut count = 0;
+    let size = events.len();
+    let mut history = Vec::with_capacity(events.len());
+    for (i, event) in events.into_iter().enumerate() {
+        match event.op {
+            Op::Call(_) => {
+                ids.insert(event.client_id, (count, i));
+                let prev = if i == 0 { None } else { Some(i - 1) };
+                history.push(Entry {
+                    id: count,
+                    event: event,
+                    matched: None, // Fill this in when the return entry is found
+                    prev: prev,
+                    next: Some(i + 1)
+                });
+                count += 1;
+            }
+            Op::Return(_) | Op::Timeout => {
+                let &(entry_id, call_index) = ids.get(&event.client_id).unwrap();
+                let next = if i+1 == size { None } else { Some(i + 1) };
+                history.push(Entry {
+                    id: entry_id,
+                    event: event,
+                    matched: None,
+                    prev: Some(i - 1),
+                    next: next
+                });
+                history[call_index].matched = Some(i)
+            }
+        }
+    }
+    return history;
+}
+
 /// The relevant parts of the history when it is not linearizable.
 ///
 /// This is used to aid in debugging
+#[derive(Debug)]
 pub struct FailureCtx {
+    last_non_linearizable_call_index: usize
 }
 
 /// The actual linearizability checker itself
@@ -89,7 +135,10 @@ pub struct Checker<M> where M: Model {
     head: usize,
 
     /// The position of the current entry
-    current: usize
+    current: usize,
+
+    /// The last non-linearizable call
+    last_non_linearizable_call_index: usize
 }
 
 impl<M> Checker<M> where M: Model {
@@ -102,7 +151,8 @@ impl<M> Checker<M> where M: Model {
             calls: Vec::with_capacity(history.len() / 2),
             history: history,
             head: 0,
-            current: 0
+            current: 0,
+            last_non_linearizable_call_index: 0
         }
     }
 
@@ -110,10 +160,10 @@ impl<M> Checker<M> where M: Model {
     ///
     /// Returns None if the check succeeds, otherwise returns a FailureCtx
     pub fn check(&mut self) -> Result<(), FailureCtx> {
-        let len = self.history.len();
         let mut head = self.head;
         let mut entry = self.get_entry(head);
-        while head + 1 < len {
+        let mut head_entry = entry;
+        while unsafe { (*head_entry).next.is_some() } {
             match unsafe { (*entry).matched } {
                 Some(return_index) => {
                     entry = self.handle_call(entry, return_index);
@@ -123,6 +173,7 @@ impl<M> Checker<M> where M: Model {
                     entry = self.handle_return()?;
                 }
             }
+            head_entry = self.get_entry(head);
         }
         Ok(())
     }
@@ -139,7 +190,11 @@ impl<M> Checker<M> where M: Model {
         let next = entry.next.unwrap();
         // Move onto the next entry
         self.current = next;
-        self.get_entry(next)
+        let next_entry = self.get_entry(next);
+        if !is_linearizable {
+            self.last_non_linearizable_call_index = unsafe {(*next_entry).prev.unwrap()};
+        }
+        next_entry
     }
 
 
@@ -154,6 +209,7 @@ impl<M> Checker<M> where M: Model {
             self.linearized.insert(entry.id);
             self.lift(entry);
             let head = self.head;
+            println!("provisionally linearize: head = {}", head);
             self.current = head;
             self.get_entry(head)
     }
@@ -182,7 +238,7 @@ impl<M> Checker<M> where M: Model {
 
             }
             None => {
-                return Err(FailureCtx{});
+                return Err(FailureCtx{last_non_linearizable_call_index: self.last_non_linearizable_call_index});
             }
         }
     }
@@ -191,6 +247,8 @@ impl<M> Checker<M> where M: Model {
         let rv = self.get_return_value(return_index);
         if let Op::Call(ref call) = entry.event.op {
             let (model_rv, new_model_state) = self.model.apply(&call);
+            println!("Call = {:?}, return_index = {:?}", call, return_index);
+            println!("rv, model_rv) = {:?}, {:?}", *rv, model_rv);
             return (*rv == model_rv, new_model_state);
         }
         unreachable!()
@@ -225,9 +283,14 @@ impl<M> Checker<M> where M: Model {
         let match_index = entry.matched.unwrap();
         let match_prev = self.history[match_index].prev;
         let match_next = self.history[match_index].next;
-        self.history[match_prev.unwrap()].next = match_next;
+        if let Some(prev) = match_prev {
+            self.history[prev].next = match_next;
+        }
         if let Some(next) = match_next {
             self.history[next].prev = match_prev;
+            if match_prev.is_none() {
+                self.head = next;
+            }
         }
     }
 
@@ -238,7 +301,9 @@ impl<M> Checker<M> where M: Model {
         let match_index = entry.matched.unwrap();
         let match_prev = self.history[match_index].prev;
         let match_next = self.history[match_index].next;
-        self.history[match_prev.unwrap()].next = Some(match_index);
+        if let Some(prev) = match_prev {
+            self.history[prev].next = Some(match_index)
+        }
         if let Some(next) = match_next {
             self.history[next].prev = Some(match_index);
         }
@@ -268,3 +333,153 @@ impl<M> Checker<M> where M: Model {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::time::Instant;
+
+    /// An operation on a counter
+    ///
+    /// We can increment it, which doesn't return a value, or get the current value.
+    #[derive(Debug)]
+    enum CounterOp {
+        Inc,
+        Get
+    }
+
+
+    /// A sequential specification for an increment-only counter
+    #[derive(Debug)]
+    struct Counter {
+        value: usize
+    }
+
+    impl Counter {
+        fn new() -> Counter {
+            Counter {
+                value: 0
+            }
+        }
+    }
+
+    impl Model for Counter {
+        type Call = CounterOp;
+
+        /// Return `None` for Inc, `Some(usize)` for Get
+        type ReturnValue = Option<usize>;
+
+        type State = usize;
+
+        fn apply(&self, op: &CounterOp) -> (Option<usize>, usize) {
+            match *op {
+                CounterOp::Inc => (None, self.value + 1),
+                CounterOp::Get => (Some(self.value), self.value)
+            }
+        }
+
+        fn state(&self) -> usize {
+            self.value
+        }
+
+        fn set_state(&mut self, state: usize) {
+            self.value = state;
+        }
+    }
+
+    // This history consists of two concurrent increments, followed by a get with the correct value
+    fn linearizable_events() -> Vec<Event<Counter>> {
+        vec![
+            Event {
+                client_id: 1,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Inc)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Inc)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Return(None)
+            },
+            Event {
+                client_id: 1,
+                time: Instant::now(),
+                op: Op::Return(None)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Get)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Return(Some(2))
+            }
+        ]
+    }
+
+    // This history consists of two concurrent increments, followed by a get with the incorrect value
+    fn non_linearizable_events() -> Vec<Event<Counter>> {
+        vec![
+            Event {
+                client_id: 1,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Inc)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Inc)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Return(None)
+            },
+            Event {
+                client_id: 1,
+                time: Instant::now(),
+                op: Op::Return(None)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Call(CounterOp::Get)
+            },
+            Event {
+                client_id: 2,
+                time: Instant::now(),
+                op: Op::Return(Some(1))
+            }
+        ]
+    }
+
+    #[test]
+    fn counter_is_linearizable() {
+        let history = events_to_history(linearizable_events());
+        let model = Counter::new();
+        let mut checker = Checker::new(model, history);
+        if let Err(e) = checker.check() {
+            panic!("Failed to linearize: {:?}", e)
+        }
+    }
+
+    #[test]
+    fn counter_not_linearizable() {
+        let history = events_to_history(non_linearizable_events());
+        let model = Counter::new();
+        let mut checker = Checker::new(model, history);
+        match checker.check() {
+            Ok(()) => panic!("non-linearizable history incorrectly checked as linearizable"),
+            Err(e) => println!("Failed to linearize: {:?}", e)
+        }
+    }
+
+}
+
