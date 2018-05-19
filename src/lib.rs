@@ -11,27 +11,18 @@ use bit_set::BitSet;
 /// Concurrent histories are checked against a model to verify linearizability
 ///
 /// The internal state of all models must be a persistent data structure.
-pub trait Model {
+pub trait Model : Hash + Eq + Clone + Debug {
     /// A Call contains an operation on a sequential type (the implementor of this model) and its
     /// arguments. It is typically an enum unless the model only has one operation.
     type Call: Debug;
 
     /// The return value of an operation on the sequential data type
-    type ReturnValue: Eq + Debug;
-
-    /// The current state of the model
-    type State: Hash + Eq + Clone + Debug;
+    type Return: Eq + Debug;
 
     /// Apply an operation to the model
     ///
-    /// Return the value and the new state of the model after application
-    fn apply(&self, op: &Self::Call) -> (Self::ReturnValue, Self::State);
-
-    /// Return a copy of the current model state
-    fn state(&self) -> Self::State;
-
-    /// Replace the existing state with the passed in value
-    fn set_state(&mut self, Self::State);
+    /// Return whether the operation is valid and the new state of the model
+    fn apply(&self, op: &Self::Call, rv: &Self::Return) -> (bool, Self);
 }
 
 /// The type representing either an operation call or return. A return can also be represented as a
@@ -40,7 +31,7 @@ pub trait Model {
 #[derive(Debug)]
 pub enum Op<M: Model> {
     Call(M::Call),
-    Return(M::ReturnValue),
+    Return(M::Return),
     Timeout
 }
 
@@ -74,10 +65,10 @@ pub struct Entry<M: Model> {
 
 /// Take an ordered list of events and convert them to a history
 fn events_to_history<M>(events: Vec<Event<M>>) -> Vec<Entry<M>> where M: Model {
-    /// Map of client calls to (entry id, entry index) pairs. There is only one outstanding call per
-    /// client at at a time, so the size of this map is bounded by the number of clients.
+    // Map of client calls to (entry id, entry index) pairs. There is only one outstanding call per
+    // client at at a time, so the size of this map is bounded by the number of clients.
     let mut ids = HashMap::<usize, (usize, usize)>::new();
-    /// The current number of calls iterated over
+    // The current number of calls iterated over
     let mut count = 0;
     let size = events.len();
     let mut history = Vec::with_capacity(events.len());
@@ -124,10 +115,10 @@ pub struct FailureCtx {
 pub struct Checker<M> where M: Model {
     linearized: BitSet,
     model: M,
-    cache: HashSet<(BitSet, M::State)>,
+    cache: HashSet<(BitSet, M)>,
 
     /// The stack of provisionally linearized calls
-    calls: Vec<(usize, M::State)>,
+    calls: Vec<(usize, M)>,
 
     history: Vec<Entry<M>>,
 
@@ -203,9 +194,9 @@ impl<M> Checker<M> where M: Model {
     /// At this point the call entry has been shown to be linearizable, and also was not checked
     /// prior since it was not in the cache. Put the entry in the calls stack, remove it from the
     /// history, update the model state and head pointer, and return the next entry to be tested.
-    fn provisionally_linearize(&mut self, entry: &mut Entry<M>, new_state: M::State) -> *mut Entry<M> {
-            self.calls.push((self.current, self.model.state()));
-            self.model.set_state(new_state);
+    fn provisionally_linearize(&mut self, entry: &mut Entry<M>, new_state: M) -> *mut Entry<M> {
+            self.calls.push((self.current, self.model.clone()));
+            self.model = new_state;
             self.linearized.insert(entry.id);
             self.lift(entry);
             let head = self.head;
@@ -216,7 +207,7 @@ impl<M> Checker<M> where M: Model {
 
     /// If the call is linearizable, update the cache.
     /// Return true if the cache was updated, false otherwise
-    fn update_cache(&mut self, entry: &Entry<M>, new_state: M::State) -> bool {
+    fn update_cache(&mut self, entry: &Entry<M>, new_state: M) -> bool {
         let mut linearized = self.linearized.clone();
         let _ = linearized.insert(entry.id);
         self.cache.insert((linearized, new_state))
@@ -227,7 +218,7 @@ impl<M> Checker<M> where M: Model {
         match self.calls.pop() {
             Some((index, new_state)) => {
                 // Revert to prior state
-                self.model.set_state(new_state);
+                self.model = new_state;
                 let entry = unsafe { &mut *self.get_entry(index) };
                 self.linearized.remove(entry.id);
                 self.unlift(entry, index);
@@ -243,18 +234,16 @@ impl<M> Checker<M> where M: Model {
         }
     }
 
-    fn apply(&self, entry: &Entry<M>, return_index: usize) -> (bool, M::State) {
+    fn apply(&self, entry: &Entry<M>, return_index: usize) -> (bool, M) {
         let rv = self.get_return_value(return_index);
         if let Op::Call(ref call) = entry.event.op {
-            let (model_rv, new_model_state) = self.model.apply(&call);
-            println!("Call = {:?}, return_index = {:?}", call, return_index);
-            println!("rv, model_rv) = {:?}, {:?}", *rv, model_rv);
-            return (*rv == model_rv, new_model_state);
+            println!("Call = {:?}, return_index = {:?}, rv = {:?}", call, return_index, *rv);
+            return self.model.apply(call, rv)
         }
         unreachable!()
     }
 
-    fn get_return_value(&self, return_index: usize) -> &M::ReturnValue {
+    fn get_return_value(&self, return_index: usize) -> &M::Return {
         let return_entry = unsafe { self.history.get_unchecked(return_index) } ;
         if let Op::Return(ref val) = return_entry.event.op {
             return val;
@@ -351,7 +340,7 @@ mod tests {
 
 
     /// A sequential specification for an increment-only counter
-    #[derive(Debug)]
+    #[derive(Debug, Hash, Clone, PartialEq, Eq)]
     struct Counter {
         value: usize
     }
@@ -362,29 +351,26 @@ mod tests {
                 value: 0
             }
         }
+
+        // Return an incremented counter
+        fn inc(&self) -> Counter {
+            Counter {
+                value: self.value + 1
+            }
+        }
     }
 
     impl Model for Counter {
         type Call = CounterOp;
 
         /// Return `None` for Inc, `Some(usize)` for Get
-        type ReturnValue = Option<usize>;
+        type Return = Option<usize>;
 
-        type State = usize;
-
-        fn apply(&self, op: &CounterOp) -> (Option<usize>, usize) {
+        fn apply(&self, op: &CounterOp, rv: &Option<usize>) -> (bool, Counter) {
             match *op {
-                CounterOp::Inc => (None, self.value + 1),
-                CounterOp::Get => (Some(self.value), self.value)
+                CounterOp::Inc => (true, self.inc()),
+                CounterOp::Get => (*rv == Some(self.value), self.clone())
             }
-        }
-
-        fn state(&self) -> usize {
-            self.value
-        }
-
-        fn set_state(&mut self, state: usize) {
-            self.value = state;
         }
     }
 
